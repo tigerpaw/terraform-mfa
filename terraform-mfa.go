@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -15,8 +16,15 @@ import (
 	ini "gopkg.in/ini.v1"
 )
 
+/*
+	Bryan Anderson
+	University of California, Irvine
+
+	Terraform MFA / Shared AWS Config Wrapper
+*/
+
 // Global Variables
-var version = "0.0.1"
+var version = "0.1.0"
 
 // AWSConfig stores AWS shared config data
 type AWSConfig struct {
@@ -26,13 +34,19 @@ type AWSConfig struct {
 }
 
 func main() {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "This is not helpful.\n")
-		flag.PrintDefaults()
-		return
-	}
+	// ToDo - Session Duration flag
 	profilePtr := flag.String("profile", "default", "AWS Profile to use")
 	versionPtr := flag.Bool("version", false, "Display version")
+	// Customize flag.Usage
+	flag.Usage = func() {
+		fmt.Fprintf(
+			os.Stderr,
+			"Usage: %s [--profile aws_profile] [command] ...\n\n",
+			filepath.Base(os.Args[0]),
+		)
+		flag.PrintDefaults()
+		os.Exit(0)
+	}
 	flag.Parse()
 	// Display version and exit
 	if *versionPtr {
@@ -42,7 +56,7 @@ func main() {
 	// Parse the AWS shared config
 	awscfg := GetAWSConfig(*profilePtr)
 	if awscfg == nil {
-		fmt.Printf("Unable to retrieve information from AWS shares config\n")
+		fmt.Printf("Unable to retrieve information from AWS shared config\n")
 		os.Exit(1)
 	}
 	// Get MFA Code
@@ -53,7 +67,7 @@ func main() {
 	// Assume Role
 	svc := sts.New(CreateSession(awscfg.profile))
 	input := &sts.AssumeRoleInput{
-		DurationSeconds: aws.Int64(180),
+		DurationSeconds: aws.Int64(900), // Minimum field value is 900
 		RoleArn:         aws.String(awscfg.role),
 		SerialNumber:    aws.String(awscfg.mfa),
 		TokenCode:       aws.String(otp),
@@ -90,16 +104,38 @@ func main() {
 
 // GetAWSConfig parses the AWS shared config and returns an AWSConfig struct
 func GetAWSConfig(profile string) *AWSConfig {
-	var home string
-	// Set home directory based off OS, untested on Windows
-	if runtime.GOOS == "windows" {
-		home = os.Getenv("USERPROFILE")
+	var home, f string
+	// Check if user has AWS_CONFIG_FILE set
+	if os.Getenv("AWS_CONFIG_FILE") == "" {
+		// Try to figure out the location based on OS, untested on Windows
+		if runtime.GOOS == "windows" {
+			home = os.Getenv("USERPROFILE")
+		} else {
+			home = os.Getenv("HOME")
+		}
+		if home == "" {
+			fmt.Printf("Please enter the full path to your aws shared config file:\n> ")
+			var input string
+			fmt.Scanln(&input)
+			fmt.Printf("\nYou can also set this value to the AWS_CONFIG_FILE environment variable\n")
+			f = input
+		} else {
+			if runtime.GOOS == "windows" {
+				f = home + "\\.aws\\config" // May not work, 'home' may have single backslashes
+			} else {
+				f = home + "/.aws/config"
+			}
+		}
 	} else {
-		home = os.Getenv("HOME")
+		f = os.Getenv("AWS_CONFIG_FILE")
 	}
-	// Try an additional env variable and possibly accept user input for .aws location
+	// Check to make sure the file we want to load actually exists
+	if _, err := os.Stat(f); os.IsNotExist(err) {
+		fmt.Printf("Bad path: %s", f)
+		return nil
+	}
 	// Check credentials file
-	cfg, err := ini.Load(home + "/.aws/config")
+	cfg, err := ini.Load(f)
 	if err != nil {
 		fmt.Printf("Message: There was an error loading the AWS shared config\nError: %s\n", err)
 		return nil
