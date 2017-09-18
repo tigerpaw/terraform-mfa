@@ -16,13 +16,6 @@ import (
 	ini "gopkg.in/ini.v1"
 )
 
-/*
-	Bryan Anderson
-	University of California, Irvine
-
-	Terraform MFA / Shared AWS Config Wrapper
-*/
-
 // Global Variables
 var version = "0.1.0"
 
