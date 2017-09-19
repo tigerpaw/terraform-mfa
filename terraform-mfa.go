@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -16,15 +17,8 @@ import (
 	ini "gopkg.in/ini.v1"
 )
 
-/*
-	Bryan Anderson
-	University of California, Irvine
-
-	Terraform MFA / Shared AWS Config Wrapper
-*/
-
 // Global Variables
-var version = "0.1.0"
+var version = "0.1.1"
 
 // AWSConfig stores AWS shared config data
 type AWSConfig struct {
@@ -34,14 +28,13 @@ type AWSConfig struct {
 }
 
 func main() {
-	// ToDo - Session Duration flag
 	profilePtr := flag.String("profile", "default", "AWS Profile to use")
 	versionPtr := flag.Bool("version", false, "Display version")
 	// Customize flag.Usage
 	flag.Usage = func() {
 		fmt.Fprintf(
 			os.Stderr,
-			"Usage: %s [--profile aws_profile] [command] ...\n\n",
+			"Usage: %s [--help] [--version] [--profile aws_profile] <command> [args]\n\n",
 			filepath.Base(os.Args[0]),
 		)
 		flag.PrintDefaults()
@@ -53,26 +46,104 @@ func main() {
 		fmt.Printf("Terraform MFA Wrapper v%s\n", version)
 		return
 	}
-	// Parse the AWS shared config
-	awscfg := GetAWSConfig(*profilePtr)
-	if awscfg == nil {
-		fmt.Printf("Unable to retrieve information from AWS shared config\n")
-		os.Exit(1)
+	// Check if we need to authenticate to AWS to run the command
+	authreq := map[string]bool{
+		"apply":   true,
+		"destroy": true,
+		"plan":    true,
 	}
-	// Get MFA Code
-	fmt.Printf("Enter MFA Code: ")
-	var otp string
-	fmt.Scanln(&otp)
-	fmt.Printf("\n")
-	// Assume Role
-	svc := sts.New(CreateSession(awscfg.profile))
-	input := &sts.AssumeRoleInput{
-		DurationSeconds: aws.Int64(900), // Minimum field value is 900
-		RoleArn:         aws.String(awscfg.role),
-		SerialNumber:    aws.String(awscfg.mfa),
-		TokenCode:       aws.String(otp),
-		RoleSessionName: aws.String("terraform"),
+	if authreq[flag.Arg(0)] {
+		// Parse the AWS shared config
+		awscfg := GetAWSConfig(*profilePtr)
+		if awscfg == nil {
+			return
+		}
+		// Get MFA Code
+		var input string
+		fmt.Printf("Enter MFA Code: ")
+		fmt.Scanln(&input)
+		fmt.Printf("\n")
+		// Assume Role
+		result, err := AssumeRole(
+			&sts.AssumeRoleInput{
+				DurationSeconds: aws.Int64(900), // Minimum field value is 900
+				RoleArn:         aws.String(awscfg.role),
+				SerialNumber:    aws.String(awscfg.mfa),
+				TokenCode:       aws.String(input),
+				RoleSessionName: aws.String("terraform"),
+			},
+			sts.New(CreateSession(awscfg.profile)),
+		)
+		if err != nil {
+			fmt.Printf("Message: Unable to assume role\nError: %s", err)
+			return
+		}
+		// Set environment variables
+		os.Setenv("AWS_ACCESS_KEY_ID", *result.Credentials.AccessKeyId)
+		os.Setenv("AWS_SECRET_ACCESS_KEY", *result.Credentials.SecretAccessKey)
+		os.Setenv("AWS_SESSION_TOKEN", *result.Credentials.SessionToken)
+		// Unset environment variables
+		defer os.Unsetenv("AWS_ACCESS_KEY_ID")
+		defer os.Unsetenv("AWS_SECRET_ACCESS_KEY")
+		defer os.Unsetenv("AWS_SESSION_TOKEN")
 	}
+	// Run Terraform
+	out, _ := exec.Command("terraform", flag.Args()...).CombinedOutput()
+	fmt.Println(string(out))
+}
+
+// GetAWSConfig parses the AWS shared config and returns an AWSConfig struct
+func GetAWSConfig(profile string) *AWSConfig {
+	var home, path, f string
+	// Check if user has AWS_CONFIG_FILE set
+	if os.Getenv("AWS_CONFIG_FILE") == "" {
+		// Try to figure out the location based on OS, untested on Windows
+		if runtime.GOOS == "windows" {
+			home, path = os.Getenv("USERPROFILE"), "\\.aws\\config" // Untested
+		} else {
+			home, path = os.Getenv("HOME"), "/.aws/config"
+		}
+		if home != "" {
+			f = home + path
+		} else {
+			var input string
+			fmt.Printf("Please enter the full path to your aws shared config file\nPath: ")
+			fmt.Scanln(&input)
+			fmt.Println("\nYou can also set this value to the AWS_CONFIG_FILE environment variable")
+			f = input
+		}
+	} else {
+		f = os.Getenv("AWS_CONFIG_FILE")
+	}
+	// Check to make sure the file we want to load actually exists
+	if _, err := os.Stat(f); os.IsNotExist(err) {
+		fmt.Printf("Bad path: %s", f)
+		return nil
+	}
+	// Check credentials file
+	cfg, err := ini.Load(f)
+	if err != nil {
+		fmt.Printf("Message: There was an error loading the AWS shared config\nError: %s\n", err)
+		return nil
+	}
+	if profile != "default" {
+		profile = "profile " + profile
+	}
+	// Check if the supplied profile is valid
+	if _, err := cfg.GetSection(profile); err != nil {
+		fmt.Printf("No such profile \"%s\" in \"%s\"\n", strings.TrimPrefix(profile, "profile "), f)
+		return nil
+	}
+	r := AWSConfig{
+		profile: cfg.Section(profile).Key("source_profile").String(),
+		role:    cfg.Section(profile).Key("role_arn").String(),
+		mfa:     cfg.Section(profile).Key("mfa_serial").String(),
+	}
+	return &r
+}
+
+// AssumeRole assumes an AWS role
+func AssumeRole(input *sts.AssumeRoleInput, svc *sts.STS) (*sts.AssumeRoleOutput, error) {
 	result, err := svc.AssumeRole(input)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
@@ -89,67 +160,12 @@ func main() {
 		} else {
 			fmt.Println(err.Error())
 		}
-		os.Exit(1)
+		return nil, err
 	}
-	// Run Terraform
-	os.Setenv("AWS_ACCESS_KEY_ID", *result.Credentials.AccessKeyId)
-	os.Setenv("AWS_SECRET_ACCESS_KEY", *result.Credentials.SecretAccessKey)
-	os.Setenv("AWS_SESSION_TOKEN", *result.Credentials.SessionToken)
-	defer os.Unsetenv("AWS_ACCESS_KEY_ID")
-	defer os.Unsetenv("AWS_SECRET_ACCESS_KEY")
-	defer os.Unsetenv("AWS_SESSION_TOKEN")
-	out, _ := exec.Command("terraform", flag.Args()...).CombinedOutput()
-	fmt.Println(string(out))
+	return result, nil
 }
 
-// GetAWSConfig parses the AWS shared config and returns an AWSConfig struct
-func GetAWSConfig(profile string) *AWSConfig {
-	var home, f string
-	// Check if user has AWS_CONFIG_FILE set
-	if os.Getenv("AWS_CONFIG_FILE") == "" {
-		// Try to figure out the location based on OS, untested on Windows
-		if runtime.GOOS == "windows" {
-			home = os.Getenv("USERPROFILE")
-		} else {
-			home = os.Getenv("HOME")
-		}
-		if home == "" {
-			fmt.Printf("Please enter the full path to your aws shared config file:\n> ")
-			var input string
-			fmt.Scanln(&input)
-			fmt.Printf("\nYou can also set this value to the AWS_CONFIG_FILE environment variable\n")
-			f = input
-		} else {
-			if runtime.GOOS == "windows" {
-				f = home + "\\.aws\\config" // May not work, 'home' may have single backslashes
-			} else {
-				f = home + "/.aws/config"
-			}
-		}
-	} else {
-		f = os.Getenv("AWS_CONFIG_FILE")
-	}
-	// Check to make sure the file we want to load actually exists
-	if _, err := os.Stat(f); os.IsNotExist(err) {
-		fmt.Printf("Bad path: %s", f)
-		return nil
-	}
-	// Check credentials file
-	cfg, err := ini.Load(f)
-	if err != nil {
-		fmt.Printf("Message: There was an error loading the AWS shared config\nError: %s\n", err)
-		return nil
-	}
-	profile = "profile " + profile
-	r := AWSConfig{
-		profile: cfg.Section(profile).Key("source_profile").String(),
-		role:    cfg.Section(profile).Key("role_arn").String(),
-		mfa:     cfg.Section(profile).Key("mfa_serial").String(),
-	}
-	return &r
-}
-
-// CreateSession creates an aws sdk session
+// CreateSession creates an AWS SDK session
 func CreateSession(profile string) *session.Session {
 	sess := session.Must(session.NewSessionWithOptions(session.Options{
 		SharedConfigState: session.SharedConfigEnable,
