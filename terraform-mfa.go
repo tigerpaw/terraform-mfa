@@ -18,7 +18,7 @@ import (
 )
 
 // Global Variables
-var version = "0.1.1"
+var version = "0.2.0"
 
 // AWSConfig stores AWS shared config data
 type AWSConfig struct {
@@ -88,8 +88,9 @@ func main() {
 		defer os.Unsetenv("AWS_SESSION_TOKEN")
 	}
 	// Run Terraform
-	out, _ := exec.Command("terraform", flag.Args()...).CombinedOutput()
-	fmt.Println(string(out))
+	cmd := exec.Command("terraform", flag.Args()...)
+	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
+	cmd.Run()
 }
 
 // GetAWSConfig parses the AWS shared config and returns an AWSConfig struct
